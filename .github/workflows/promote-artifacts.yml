@@ -1,0 +1,63 @@
+name: Stage verified 0.2.14 artifacts
+on:
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: Qualified artifact identities and temporary download locations
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  stage:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Verify every byte and upload only to the existing draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node <<'NODE'
+          const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
+          const assert=require('node:assert/strict'),{execFileSync}=require('node:child_process');
+          const {Readable}=require('node:stream'),{pipeline}=require('node:stream/promises');
+          let phase='validation';
+          (async()=>{
+            const repo='aliabedi1/scribe-desktop-releases',version='0.2.14';
+            assert.equal(process.env.GITHUB_REPOSITORY,repo);
+            const input=JSON.parse(JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH,'utf8')).inputs.manifest);
+            const names=[`Scribe-Desktop-Setup-${version}-x64.exe`,`Scribe-Desktop-Setup-${version}-x64.exe.blockmap`,`Scribe-Desktop-${version}-x64.AppImage`,'latest.yml','latest-linux.yml'];
+            assert.equal(input.version,version);assert.equal(input.files.length,5);
+            assert.deepEqual(input.files.map(item=>item.file).sort(),names.sort());
+            const gh=args=>execFileSync('gh',args,{encoding:'utf8'});
+            const draft=JSON.parse(gh(['release','view','v'+version,'--repo',repo,'--json','isDraft,assets']));
+            assert(draft.isDraft&&draft.assets.length===0);
+            const directory=path.join(process.env.RUNNER_TEMP,'scribe-public-0.2.14');fs.mkdirSync(directory,{recursive:true});
+            for(const item of input.files){
+              assert(/^[a-f0-9]{64}$/.test(item.sha256));
+              assert(Number.isSafeInteger(item.bytes)&&item.bytes>0&&item.bytes<512*1024*1024);
+              const url=new URL(item.url);
+              assert(url.protocol==='https:'&&url.hostname==='release-assets.githubusercontent.com'&&!url.username&&!url.password);
+              console.log('::add-mask::'+item.url);
+            }
+            phase='transfer';
+            await Promise.all(input.files.map(async item=>{
+              const response=await fetch(item.url,{signal:AbortSignal.timeout(240000)});
+              assert.equal(response.status,200);
+              const file=path.join(directory,item.file);
+              await pipeline(Readable.fromWeb(response.body),fs.createWriteStream(file,{flags:'wx'}));
+              assert.equal(fs.statSync(file).size,item.bytes);
+              const hash=crypto.createHash('sha256');for await(const chunk of fs.createReadStream(file))hash.update(chunk);
+              assert.equal(hash.digest('hex'),item.sha256);
+            }));
+            phase='draft-upload';
+            gh(['release','upload','v'+version,'--repo',repo,...input.files.map(item=>path.join(directory,item.file))]);
+            console.log(JSON.stringify({passed:true,version,files:input.files.map(({file,bytes,sha256})=>({file,bytes,sha256}))}));
+          })().catch(error=>{console.error(JSON.stringify({passed:false,phase,errorType:error.name}));process.exitCode=1;});
+          NODE
